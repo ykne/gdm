@@ -33,10 +33,15 @@ G_DECLARE_FINAL_TYPE (GdmSession, gdm_session, GDM, SESSION, GObject)
 typedef enum
 {
         GDM_SESSION_VERIFICATION_MODE_LOGIN,
+        GDM_SESSION_VERIFICATION_MODE_CHOOSER,
         GDM_SESSION_VERIFICATION_MODE_REAUTHENTICATE
 } GdmSessionVerificationMode;
 
 typedef enum {
+        /* We reuse the existing display server, e.g. X server
+         * in "classic" mode from the greeter for the first seat. */
+        GDM_SESSION_DISPLAY_MODE_REUSE_VT,
+
         /* Doesn't know anything about VTs. Tries to set DRM
          * master and will throw a tantrum if something bad
          * happens. e.g. weston-launch or mutter-launch. */
@@ -54,9 +59,11 @@ const char * gdm_session_display_mode_to_string (GdmSessionDisplayMode mode);
 
 GdmSession      *gdm_session_new                      (GdmSessionVerificationMode verification_mode,
                                                        uid_t         allowed_user,
+                                                       const char   *display_name,
                                                        const char   *display_hostname,
                                                        const char   *display_device,
                                                        const char   *display_seat_id,
+                                                       const char   *display_x11_authority_file,
                                                        gboolean      display_is_local,
                                                        const char * const *environment);
 uid_t             gdm_session_get_allowed_user       (GdmSession     *session);
@@ -69,6 +76,7 @@ const char       *gdm_session_get_username                (GdmSession     *sessi
 const char       *gdm_session_get_display_device          (GdmSession     *session);
 const char       *gdm_session_get_display_seat_id         (GdmSession     *session);
 const char       *gdm_session_get_session_id              (GdmSession     *session);
+gboolean          gdm_session_bypasses_xsession           (GdmSession     *session);
 gboolean          gdm_session_session_registers           (GdmSession     *session);
 GdmSessionDisplayMode gdm_session_get_display_mode  (GdmSession     *session);
 gboolean          gdm_session_start_conversation          (GdmSession *session,
@@ -112,6 +120,8 @@ void              gdm_session_report_error                (GdmSession *session,
                                                            const char *service_name,
                                                            GDBusError  code,
                                                            const char *message);
+void              gdm_session_select_program              (GdmSession *session,
+                                                           const char *command_line);
 void              gdm_session_select_session              (GdmSession *session,
                                                            const char *session_name);
 void              gdm_session_select_user                 (GdmSession *session,

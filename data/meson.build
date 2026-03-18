@@ -1,6 +1,27 @@
 subdir('applications')
 subdir('dconf')
 
+# XPath configs
+foreach file : [ 'Init', 'PreSession', 'PostSession' ]
+  generated_file = configure_file(
+    input: '@0@.in'.format(file),
+    output: file,
+    configuration: { 'X_PATH':  x_path },
+  )
+
+  install_data(generated_file,
+    install_dir: gdmconfdir / file,
+    install_mode: 'rwxr-xr-x',
+    rename: 'Default'
+  )
+endforeach
+
+install_data('PostLogin',
+  rename: 'Default.sample',
+  install_mode: 'rwxr-xr-x',
+  install_dir: gdmconfdir / 'PostLogin',
+)
+
 # gdm.conf
 configure_file(
   input: 'gdm.conf.in',
@@ -24,7 +45,15 @@ install_data('org.gnome.login-screen.gschema.xml',
 )
 compiled_gschema = gnome.compile_schemas()
 
-install_data('gdm.schemas',
+# gdm.schema
+gdm_schema = configure_file(
+  input: 'gdm.schemas.in',
+  output: '@BASENAME@',
+  configuration: {
+    'GDM_USERNAME': get_option('user'),
+    'GDM_GROUPNAME': get_option('group'),
+    'gdmconfdir': gdmconfdir,
+  },
   install_dir: gdm_datadir,
 )
 
@@ -37,23 +66,6 @@ install_data(
     install_dir: get_option('datadir') / 'gnome-session' / 'sessions',
 )
 
-desktop_files = [
-  'gnome-greeter.desktop.in',
-  'gnome-initial-setup.desktop.in'
-]
-
-foreach desktop_file : desktop_files
-  configure_file(
-    input: desktop_file,
-    output: '@BASENAME@',
-    configuration: {
-      'gdmdatadir': gdm_prefix / get_option('datadir') / 'gdm',
-      'libexecdir': gdm_prefix / get_option('libexecdir'),
-    },
-    install_dir: get_option('datadir') / 'gdm' / 'greeter' / 'wayland-sessions',
-  )
-endforeach
-
 # PAM
 pam_data_files_map = {
   'redhat': [
@@ -62,7 +74,6 @@ pam_data_files_map = {
     'gdm-fingerprint',
     'gdm-smartcard',
     'gdm-password',
-    'gdm-switchable-auth',
   ],
   'openembedded': [
     'gdm-autologin',
@@ -140,16 +151,6 @@ if systemdsystemunitdir != 'no'
     install_dir: systemd_systemunitdir,
     format: 'cmake'
   )
-
-  configure_file(
-    input: 'gnome-headless-session@.service.in',
-    output: '@BASENAME@',
-    configuration: {
-      'GDM_GROUPNAME': get_option('group'),
-      'libexecdir': gdm_prefix / get_option('libexecdir'),
-    },
-    install_dir: systemd_systemunitdir,
-  )
 endif
 
 if systemduserunitdir != 'no'
@@ -180,8 +181,4 @@ configure_file(
     'GDM_GROUPNAME': get_option('group'),
   },
   install_dir: get_option('datadir') / 'polkit-1' / 'rules.d',
-)
-install_data(
-  'org.gnome.displaymanager.policy',
-  install_dir: get_option('datadir') / 'polkit-1' / 'actions',
 )

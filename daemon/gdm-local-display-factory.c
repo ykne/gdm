@@ -44,12 +44,14 @@
 #include "gdm-settings-direct.h"
 #include "gdm-display-store.h"
 #include "gdm-local-display.h"
+#include "gdm-legacy-display.h"
 
 #define GDM_DBUS_PATH                       "/org/gnome/DisplayManager"
 #define GDM_LOCAL_DISPLAY_FACTORY_DBUS_PATH GDM_DBUS_PATH "/LocalDisplayFactory"
 #define GDM_MANAGER_DBUS_NAME               "org.gnome.DisplayManager.LocalDisplayFactory"
 
-#define MAX_DISPLAY_FAILURES 5
+#define MAX_DISPLAY_FAILURES 10
+#define N_FAILURES_UNTIL_FALLBACK 5
 #define WAIT_TO_FINISH_TIMEOUT 10 /* seconds */
 #define SEAT0_GRAPHICS_CHECK_TIMEOUT 10 /* seconds */
 
@@ -62,6 +64,7 @@ struct _GdmLocalDisplayFactory
 
         GdmDBusLocalDisplayFactory *skeleton;
         GDBusConnection *connection;
+        GHashTable      *used_display_numbers;
 
         /* FIXME: this needs to be per seat? */
         guint            num_failures;
@@ -80,9 +83,11 @@ struct _GdmLocalDisplayFactory
 
         gulong           uevent_handler_id;
 
+#if defined(ENABLE_USER_DISPLAY_SERVER)
         unsigned int     active_vt;
         guint            active_vt_watch_id;
         guint            wait_to_finish_timeout_id;
+#endif
 
         gboolean         is_started;
 };
@@ -129,6 +134,246 @@ gdm_local_display_factory_error_quark (void)
 }
 
 static void
+listify_hash (gpointer    key,
+              GdmDisplay *display,
+              GList     **list)
+{
+        *list = g_list_prepend (*list, key);
+}
+
+static int
+sort_nums (gpointer a,
+           gpointer b)
+{
+        guint32 num_a;
+        guint32 num_b;
+
+        num_a = GPOINTER_TO_UINT (a);
+        num_b = GPOINTER_TO_UINT (b);
+
+        if (num_a > num_b) {
+                return 1;
+        } else if (num_a < num_b) {
+                return -1;
+        } else {
+                return 0;
+        }
+}
+
+static guint32
+take_next_display_number (GdmLocalDisplayFactory *factory)
+{
+        GList  *list;
+        GList  *l;
+        guint32 ret;
+
+        ret = 0;
+        list = NULL;
+
+        g_hash_table_foreach (factory->used_display_numbers, (GHFunc)listify_hash, &list);
+        if (list == NULL) {
+                goto out;
+        }
+
+        /* sort low to high */
+        list = g_list_sort (list, (GCompareFunc)sort_nums);
+
+        g_debug ("GdmLocalDisplayFactory: Found the following X displays:");
+        for (l = list; l != NULL; l = l->next) {
+                g_debug ("GdmLocalDisplayFactory: %u", GPOINTER_TO_UINT (l->data));
+        }
+
+        for (l = list; l != NULL; l = l->next) {
+                guint32 num;
+                num = GPOINTER_TO_UINT (l->data);
+
+                /* always fill zero */
+                if (l->prev == NULL && num != 0) {
+                        ret = 0;
+                        break;
+                }
+                /* now find the first hole */
+                if (l->next == NULL || GPOINTER_TO_UINT (l->next->data) != (num + 1)) {
+                        ret = num + 1;
+                        break;
+                }
+        }
+ out:
+
+        /* now reserve this number */
+        g_debug ("GdmLocalDisplayFactory: Reserving X display: %u", ret);
+        g_hash_table_insert (factory->used_display_numbers, GUINT_TO_POINTER (ret), NULL);
+
+        return ret;
+}
+
+static char *
+get_preferred_display_server (GdmLocalDisplayFactory *factory)
+{
+        g_autofree gchar *preferred_display_server = NULL;
+        gboolean wayland_enabled = FALSE, xorg_enabled = FALSE;
+
+#if defined (ENABLE_WAYLAND_SUPPORT) && defined (ENABLE_X11_SUPPORT)
+        gdm_settings_direct_get_boolean (GDM_KEY_WAYLAND_ENABLE, &wayland_enabled);
+        gdm_settings_direct_get_boolean (GDM_KEY_XORG_ENABLE, &xorg_enabled);
+#elif defined (ENABLE_WAYLAND_SUPPORT)
+        wayland_enabled = TRUE;
+#elif defined (ENABLE_X11_SUPPORT)
+        xorg_enabled = TRUE;
+#else
+#error "GDM needs to be compiled with support for either wayland or Xorg or both"
+#endif
+
+        if (wayland_enabled && !xorg_enabled) {
+                return g_strdup ("wayland");
+        }
+
+        if (!wayland_enabled && !xorg_enabled) {
+                return g_strdup ("none");
+        }
+
+        gdm_settings_direct_get_string (GDM_KEY_PREFERRED_DISPLAY_SERVER, &preferred_display_server);
+
+        if (g_strcmp0 (preferred_display_server, "wayland") == 0) {
+                if (wayland_enabled)
+                        return g_strdup (preferred_display_server);
+#ifdef ENABLE_X11_SUPPORT
+                else
+                        return g_strdup ("xorg");
+#endif
+        }
+
+        if (g_strcmp0 (preferred_display_server, "xorg") == 0) {
+#ifdef ENABLE_X11_SUPPORT
+                if (xorg_enabled)
+                        return g_strdup (preferred_display_server);
+                else
+#endif
+                        return g_strdup ("wayland");
+        }
+
+#ifdef ENABLE_X11_SUPPORT
+        if (g_strcmp0 (preferred_display_server, "legacy-xorg") == 0) {
+                if (xorg_enabled)
+                        return g_strdup (preferred_display_server);
+        }
+#endif
+
+        return g_strdup ("none");
+}
+
+struct GdmDisplayServerConfiguration {
+        const char *display_server;
+        const char *key;
+        const char *binary;
+        const char *session_type;
+} display_server_configuration[] = {
+#ifdef ENABLE_WAYLAND_SUPPORT
+        { "wayland", GDM_KEY_WAYLAND_ENABLE, NULL, "wayland" },
+#endif
+#ifdef ENABLE_X11_SUPPORT
+        { "xorg", GDM_KEY_XORG_ENABLE, "/usr/bin/Xorg", "x11" },
+#endif
+        { NULL, NULL, NULL },
+};
+
+static gboolean
+display_server_enabled (GdmLocalDisplayFactory *factory,
+                        const char             *display_server)
+{
+        size_t i;
+
+        for (i = 0; display_server_configuration[i].display_server != NULL; i++) {
+                const char *key = display_server_configuration[i].key;
+                const char *binary = display_server_configuration[i].binary;
+                gboolean enabled = FALSE;
+
+                if (!g_str_equal (display_server_configuration[i].display_server,
+                                  display_server))
+                        continue;
+
+#if defined (ENABLE_WAYLAND_SUPPORT) && defined (ENABLE_X11_SUPPORT)
+                if (!gdm_settings_direct_get_boolean (key, &enabled) || !enabled)
+                        return FALSE;
+#endif
+
+                if (binary && !g_file_test (binary, G_FILE_TEST_IS_EXECUTABLE))
+                        return FALSE;
+
+                return TRUE;
+        }
+
+        return FALSE;
+}
+
+static const char *
+get_session_type_for_display_server (GdmLocalDisplayFactory *factory,
+                                     const char             *display_server)
+{
+        size_t i;
+
+        for (i = 0; display_server_configuration[i].display_server != NULL; i++) {
+                if (!g_str_equal (display_server_configuration[i].display_server,
+                                  display_server))
+                        continue;
+
+                return display_server_configuration[i].session_type;
+        }
+
+        return NULL;
+}
+
+static char **
+gdm_local_display_factory_get_session_types (GdmLocalDisplayFactory *factory,
+                                             gboolean                should_fall_back)
+{
+        g_autofree gchar *preferred_display_server = NULL;
+        const char *fallback_display_server = NULL;
+        gboolean wayland_preferred = FALSE;
+        gboolean xorg_preferred = FALSE;
+        g_autoptr (GPtrArray) session_types_array = NULL;
+        char **session_types;
+
+        session_types_array = g_ptr_array_new ();
+
+        preferred_display_server = get_preferred_display_server (factory);
+
+        g_debug ("GdmLocalDisplayFactory: Getting session type (prefers %s, falling back: %s)",
+                 preferred_display_server, should_fall_back? "yes" : "no");
+
+        wayland_preferred = g_str_equal (preferred_display_server, "wayland");
+        xorg_preferred = g_str_equal (preferred_display_server, "xorg");
+
+#ifdef ENABLE_X11_SUPPORT
+        if (wayland_preferred)
+                fallback_display_server = "xorg";
+        else if (xorg_preferred)
+                fallback_display_server = "wayland";
+        else
+                return NULL;
+#endif
+
+        if (!should_fall_back || fallback_display_server == NULL) {
+                if (display_server_enabled (factory, preferred_display_server))
+                      g_ptr_array_add (session_types_array, (gpointer) get_session_type_for_display_server (factory, preferred_display_server));
+        }
+
+#ifdef ENABLE_X11_SUPPORT
+        if (display_server_enabled (factory, fallback_display_server))
+                g_ptr_array_add (session_types_array, (gpointer) get_session_type_for_display_server (factory, fallback_display_server));
+#endif
+
+        if (session_types_array->len == 0)
+                return NULL;
+
+        g_ptr_array_add (session_types_array, NULL);
+
+        session_types = g_strdupv ((char **) session_types_array->pdata);
+
+        return session_types;
+}
+
+static void
 on_display_disposed (GdmLocalDisplayFactory *factory,
                      GdmDisplay             *display)
 {
@@ -145,25 +390,6 @@ store_display (GdmLocalDisplayFactory *factory,
         gdm_display_store_add (store, display);
 }
 
-static char **
-gdm_local_display_factory_get_session_types (GdmLocalDisplayFactory *factory)
-{
-        g_autoptr (GStrvBuilder) builder = NULL;
-
-        builder = g_strv_builder_new ();
-
-        g_strv_builder_add (builder, "wayland");
-
-#ifdef ENABLE_X11_SUPPORT
-        gboolean x11_enabled = FALSE;
-        gdm_settings_direct_get_boolean (GDM_KEY_XORG_ENABLE, &x11_enabled);
-        if (x11_enabled && gdm_find_x_server () != NULL)
-                g_strv_builder_add (builder, "x11");
-#endif
-
-        return g_strv_builder_end (builder);
-}
-
 /*
   Example:
   dbus-send --system --dest=org.gnome.DisplayManager \
@@ -171,49 +397,89 @@ gdm_local_display_factory_get_session_types (GdmLocalDisplayFactory *factory)
   /org/gnome/DisplayManager/Manager \
   org.gnome.DisplayManager.Manager.GetDisplays
 */
-static gboolean
-gdm_local_display_factory_create_display (GdmLocalDisplayFactory  *factory,
-                                          const char              *autologin_user,
-                                          char                   **id,
-                                          GError                 **error)
+gboolean
+gdm_local_display_factory_create_transient_display (GdmLocalDisplayFactory *factory,
+                                                    char                  **id,
+                                                    GError                **error)
 {
-        g_auto(GStrv) session_types = NULL;
-        g_autoptr (GdmDisplay) display = NULL;
+        gboolean         ret;
+        GdmDisplay      *display = NULL;
+        gboolean         is_initial = FALSE;
+        g_autofree gchar *preferred_display_server = NULL;
 
-        g_debug ("GdmLocalDisplayFactory: Creating local display");
+        g_return_val_if_fail (GDM_IS_LOCAL_DISPLAY_FACTORY (factory), FALSE);
 
-        session_types = gdm_local_display_factory_get_session_types (factory);
+        ret = FALSE;
 
-        display = gdm_local_display_new ();
-        g_object_set (G_OBJECT (display),
-                      "supported-session-types", session_types,
+        g_debug ("GdmLocalDisplayFactory: Creating transient display");
+
+        preferred_display_server = get_preferred_display_server (factory);
+
+#ifdef ENABLE_USER_DISPLAY_SERVER
+        if (g_strcmp0 (preferred_display_server, "wayland") == 0 ||
+            g_strcmp0 (preferred_display_server, "xorg") == 0) {
+                g_auto(GStrv) session_types = NULL;
+
+                session_types = gdm_local_display_factory_get_session_types (factory, FALSE);
+
+                if (session_types == NULL) {
+                        g_set_error_literal (error,
+                                             GDM_DISPLAY_ERROR,
+                                             GDM_DISPLAY_ERROR_GENERAL,
+                                             "Both Wayland and Xorg are unavailable");
+                        return FALSE;
+                }
+
+                display = gdm_local_display_new ();
+                g_object_set (G_OBJECT (display),
+                              "session-type", session_types[0],
+                              "supported-session-types", session_types,
+                              NULL);
+                is_initial = TRUE;
+        }
+#endif
+        if (g_strcmp0 (preferred_display_server, "legacy-xorg") == 0) {
+                if (display == NULL) {
+                        guint32 num;
+
+                        num = take_next_display_number (factory);
+
+                        display = gdm_legacy_display_new (num);
+                }
+        }
+
+        if (display == NULL) {
+                g_set_error_literal (error,
+                                     GDM_DISPLAY_ERROR,
+                                     GDM_DISPLAY_ERROR_GENERAL,
+                                     "Invalid preferred display server configured");
+                return FALSE;
+        }
+
+        g_object_set (display,
                       "seat-id", "seat0",
                       "allow-timed-login", FALSE,
-                      "is-initial", TRUE,
-                      "autologin-user", autologin_user,
+                      "is-initial", is_initial,
                       NULL);
 
         store_display (factory, display);
 
-        if (!gdm_display_prepare (display)) {
-                g_set_error_literal (error,
-                                     GDM_DISPLAY_ERROR,
-                                     GDM_DISPLAY_ERROR_GENERAL,
-                                     "Failed preparing display");
-                gdm_display_unmanage (display);
-                return FALSE;
+        if (! gdm_display_manage (display)) {
+                display = NULL;
+                goto out;
         }
 
-        if (!gdm_display_get_id (display, id, NULL)) {
-                g_set_error_literal (error,
-                                     GDM_DISPLAY_ERROR,
-                                     GDM_DISPLAY_ERROR_GENERAL,
-                                     "Failed getting display id");
-                gdm_display_unmanage (display);
-                return FALSE;
+        if (! gdm_display_get_id (display, id, NULL)) {
+                display = NULL;
+                goto out;
         }
 
-        return TRUE;
+        ret = TRUE;
+ out:
+        /* ref either held by store or not at all */
+        g_object_unref (display);
+
+        return ret;
 }
 
 static void
@@ -253,25 +519,51 @@ on_finish_waiting_for_seat0_displays_timeout (GdmLocalDisplayFactory *factory)
 }
 
 static void
+on_session_registered_cb (GObject *gobject,
+                          GParamSpec *pspec,
+                          gpointer user_data)
+{
+        GdmDisplay *display = GDM_DISPLAY (gobject);
+        GdmLocalDisplayFactory *factory = GDM_LOCAL_DISPLAY_FACTORY (user_data);
+        gboolean registered;
+
+        g_object_get (display, "session-registered", &registered, NULL);
+
+        if (!registered)
+                return;
+
+        g_debug ("GdmLocalDisplayFactory: session registered on display, looking for any background displays to kill");
+
+        finish_waiting_displays_on_seat (factory, "seat0");
+}
+
+static void
 on_display_status_changed (GdmDisplay             *display,
                            GParamSpec             *arg1,
                            GdmLocalDisplayFactory *factory)
 {
         int              status;
+        int              num;
         char            *seat_id = NULL;
         char            *seat_active_session = NULL;
+        char            *session_type = NULL;
         char            *session_class = NULL;
         char            *session_id = NULL;
         gboolean         is_initial = TRUE;
         gboolean         is_local = TRUE;
 
+
         if (!factory->is_started)
                 return;
+
+        num = -1;
+        gdm_display_get_x11_display_number (display, &num, NULL);
 
         g_object_get (display,
                       "seat-id", &seat_id,
                       "is-initial", &is_initial,
                       "is-local", &is_local,
+                      "session-type", &session_type,
                       "session-class", &session_class,
                       "session-id", &session_id,
                       NULL);
@@ -283,6 +575,11 @@ on_display_status_changed (GdmDisplay             *display,
         g_debug ("GdmLocalDisplayFactory: display status changed: %d", status);
         switch (status) {
         case GDM_DISPLAY_FINISHED:
+                /* remove the display number from factory->used_display_numbers
+                   so that it may be reused */
+                if (num != -1) {
+                        g_hash_table_remove (factory->used_display_numbers, GUINT_TO_POINTER (num));
+                }
                 gdm_display_factory_queue_purge_displays (GDM_DISPLAY_FACTORY (factory));
 
                 /* if this is a local display, ensure that we get a login
@@ -291,7 +588,10 @@ on_display_status_changed (GdmDisplay             *display,
                 if (is_local &&
                     ((g_strcmp0 (session_class, "greeter") != 0 &&
                       (!seat_active_session || g_strcmp0(session_id, seat_active_session) == 0)) ||
-                     factory->active_vt == GDM_INITIAL_VT || g_strcmp0 (seat_id, "seat0") != 0)) {
+#if defined(ENABLE_USER_DISPLAY_SERVER)
+                     (g_strcmp0 (seat_id, "seat0") == 0 && factory->active_vt == GDM_INITIAL_VT) ||
+#endif
+                     g_strcmp0 (seat_id, "seat0") != 0)) {
                         /* reset num failures */
                         factory->num_failures = 0;
 
@@ -299,6 +599,8 @@ on_display_status_changed (GdmDisplay             *display,
                 }
                 break;
         case GDM_DISPLAY_FAILED:
+                /* leave the display number in factory->used_display_numbers
+                   so that it doesn't get reused */
                 gdm_display_factory_queue_purge_displays (GDM_DISPLAY_FACTORY (factory));
 
                 /* Create a new equivalent display if it was static */
@@ -308,7 +610,7 @@ on_display_status_changed (GdmDisplay             *display,
 
                         /* oh shit */
                         if (factory->num_failures > MAX_DISPLAY_FAILURES)
-                                g_warning ("GdmLocalDisplayFactory: maximum number of display failures reached. Giving up.");
+                                g_warning ("GdmLocalDisplayFactory: maximum number of X display failures reached: check X server log for errors");
                         else
                                 ensure_display_for_seat (factory, seat_id);
                 }
@@ -318,7 +620,13 @@ on_display_status_changed (GdmDisplay             *display,
         case GDM_DISPLAY_PREPARED:
                 break;
         case GDM_DISPLAY_MANAGED:
-                finish_waiting_displays_on_seat (factory, "seat0");
+#if defined(ENABLE_USER_DISPLAY_SERVER)
+                g_signal_connect_object (display,
+                                         "notify::session-registered",
+                                         G_CALLBACK (on_session_registered_cb),
+                                         factory,
+                                         0);
+#endif
                 break;
         case GDM_DISPLAY_WAITING_TO_FINISH:
                 break;
@@ -329,6 +637,7 @@ on_display_status_changed (GdmDisplay             *display,
 
         g_free (seat_id);
         g_free (seat_active_session);
+        g_free (session_type);
         g_free (session_class);
         g_free (session_id);
 }
@@ -428,7 +737,6 @@ udev_is_settled (GdmLocalDisplayFactory *factory)
                 const gchar *id_path = g_udev_device_get_property (device, "ID_PATH");
                 g_autoptr (GUdevDevice) platform_device = NULL;
                 g_autoptr (GUdevDevice) pci_device = NULL;
-                g_autoptr (GUdevDevice) drm_device = NULL;
 
                 if (g_strrstr (id_path, "platform-simple-framebuffer") != NULL) {
                         node = next_node;
@@ -456,28 +764,10 @@ udev_is_settled (GdmLocalDisplayFactory *factory)
                                  factory->seat0_has_boot_up_graphics = TRUE;
                                  is_settled = TRUE;
                                  break;
+                        } else {
+                                 g_debug ("GdmLocalDisplayFactory: Found secondary PCI graphics adapter, not proceeding yet.");
                         }
                 }
-
-                drm_device = g_udev_device_get_parent_with_subsystem (device, "drm", NULL);
-
-                if (drm_device != NULL) {
-                        gboolean boot_display;
-
-                        boot_display = g_udev_device_get_sysfs_attr_as_int (drm_device, "boot_display");
-
-                        if (boot_display == 1) {
-                                 g_debug ("GdmLocalDisplayFactory: Found primary PCI graphics adapter, proceeding.");
-                                 factory->seat0_has_boot_up_graphics = TRUE;
-                                 is_settled = TRUE;
-                                 break;
-                        }
-                }
-
-                if (pci_device != NULL || drm_device != NULL) {
-                        g_debug ("GdmLocalDisplayFactory: Found secondary PCI graphics adapter, not proceeding yet.");
-                }
-
                 node = next_node;
         }
 
@@ -491,12 +781,10 @@ udev_is_settled (GdmLocalDisplayFactory *factory)
 }
 #endif
 
-static gboolean
+static int
 on_seat0_graphics_check_timeout (gpointer user_data)
 {
         GdmLocalDisplayFactory *factory = user_data;
-
-        g_warning ("It appears that your system does not have a primary GPU! Proceeding with any GPU");
 
         factory->seat0_graphics_check_timeout_id = 0;
 
@@ -509,7 +797,7 @@ on_seat0_graphics_check_timeout (gpointer user_data)
         return G_SOURCE_REMOVE;
 }
 
-static GdmDisplay *
+GdmDisplay *
 get_display_for_seat (GdmLocalDisplayFactory *factory,
                       const char             *seat_id)
 {
@@ -525,18 +813,22 @@ get_display_for_seat (GdmLocalDisplayFactory *factory,
         else
                 display = gdm_display_store_find (store, lookup_managed_display_by_seat_id, (gpointer) seat_id);
 
-        return display != NULL ? g_object_ref (display) : NULL;
+        return display;
 }
 
 static void
 ensure_display_for_seat (GdmLocalDisplayFactory *factory,
                          const char             *seat_id)
 {
+        gboolean seat_supports_graphics;
         gboolean is_seat0;
+        gboolean falling_back;
         g_auto (GStrv) session_types = NULL;
-        g_autoptr (GdmDisplay) display = NULL;
+        const char *legacy_session_types[] = { "x11", NULL };
+        GdmDisplay      *display = NULL;
         g_autofree char *login_session_id = NULL;
-        int ret;
+        g_autofree gchar *preferred_display_server = NULL;
+        gboolean waiting_on_udev = FALSE;
 
         g_debug ("GdmLocalDisplayFactory: display for seat %s requested", seat_id);
 
@@ -560,46 +852,110 @@ ensure_display_for_seat (GdmLocalDisplayFactory *factory,
                 }
         }
 
-        is_seat0 = g_strcmp0 (seat_id, "seat0") == 0;
+        preferred_display_server = get_preferred_display_server (factory);
+
+        if (g_strcmp0 (preferred_display_server, "none") == 0) {
+               g_debug ("GdmLocalDisplayFactory: Preferred display server is none, so not creating display");
+               return;
+        }
 
 #ifdef HAVE_UDEV
-        if (!udev_is_settled (factory)) {
-                g_debug ("GdmLocalDisplayFactory: udev is still settling, so not creating display yet");
-
-                if (is_seat0 && factory->seat0_graphics_check_timeout_id == 0) {
-                        g_debug("GdmLocalDisplayFactory: Waiting for up to %d seconds for a primary GPU to appear",
-                                SEAT0_GRAPHICS_CHECK_TIMEOUT);
-                        factory->seat0_graphics_check_timeout_id = g_timeout_add_seconds (SEAT0_GRAPHICS_CHECK_TIMEOUT,
-                                                                                          on_seat0_graphics_check_timeout,
-                                                                                          factory);
-                }
-
-                return;
-        }
+        waiting_on_udev = !udev_is_settled (factory);
 #endif
 
-        g_clear_handle_id (&factory->seat0_graphics_check_timeout_id, g_source_remove);
+        if (!waiting_on_udev) {
+                int ret;
 
-        ret = sd_seat_can_graphical (seat_id);
+                ret = sd_seat_can_graphical (seat_id);
 
-        if (ret < 0) {
-                g_critical ("Failed to query CanGraphical information for seat %s", seat_id);
-                return;
+                if (ret < 0) {
+                        g_critical ("Failed to query CanGraphical information for seat %s", seat_id);
+                        return;
+                }
+
+                if (ret == 0) {
+                        g_debug ("GdmLocalDisplayFactory: System doesn't currently support graphics");
+                        seat_supports_graphics = FALSE;
+                } else {
+                        g_debug ("GdmLocalDisplayFactory: System supports graphics");
+                        seat_supports_graphics = TRUE;
+                }
+        } else {
+               g_debug ("GdmLocalDisplayFactory: udev is still settling, so not creating display yet");
+               seat_supports_graphics = FALSE;
         }
 
-        if (ret == 0) {
-                g_debug ("GdmLocalDisplayFactory: System doesn't currently support graphics");
+        is_seat0 = g_strcmp0 (seat_id, "seat0") == 0;
+
+        falling_back = factory->num_failures > N_FAILURES_UNTIL_FALLBACK;
+        session_types = gdm_local_display_factory_get_session_types (factory, falling_back);
+
+        if (session_types == NULL) {
+                g_debug ("GdmLocalDisplayFactory: Both Wayland and Xorg are unavailable");
+                seat_supports_graphics = FALSE;
+        } else {
+                g_debug ("GdmLocalDisplayFactory: New displays on seat0 will use %s%s",
+                         session_types[0], falling_back? " fallback" : "");
+        }
+
+        /* For seat0, we have a fallback logic to still try starting it after
+         * SEAT0_GRAPHICS_CHECK_TIMEOUT seconds. i.e. we simply continue even if
+         * CanGraphical is unset or udev otherwise never finds a suitable graphics card.
+         * This is ugly, but it means we'll come up eventually in some
+         * scenarios where no master device is present.
+         * Note that we'll force an X11 fallback even though there might be
+         * cases where an wayland capable device is present and simply not marked as
+         * master-of-seat. In these cases, this should likely be fixed in the
+         * udev rules.
+         *
+         * At the moment, systemd always sets CanGraphical for non-seat0 seats.
+         * This is because non-seat0 seats are defined by having master-of-seat
+         * set. This means we can avoid the fallback check for non-seat0 seats,
+         * which simplifies the code.
+         */
+        if (is_seat0) {
+                if (!seat_supports_graphics) {
+                        if (!factory->seat0_graphics_check_timed_out) {
+                                if (factory->seat0_graphics_check_timeout_id == 0) {
+                                        g_debug ("GdmLocalDisplayFactory: seat0 doesn't yet support graphics.  Waiting %d seconds to try again.", SEAT0_GRAPHICS_CHECK_TIMEOUT);
+                                        factory->seat0_graphics_check_timeout_id = g_timeout_add_seconds (SEAT0_GRAPHICS_CHECK_TIMEOUT,
+                                                                                                          on_seat0_graphics_check_timeout,
+                                                                                                          factory);
+
+                                } else {
+                                        /* It is not yet time to force X11 fallback. */
+                                        g_debug ("GdmLocalDisplayFactory: seat0 display requested when there is no graphics support before graphics check timeout.");
+                                }
+
+                                return;
+                        }
+
+#ifdef ENABLE_X11_SUPPORT
+                        g_debug ("GdmLocalDisplayFactory: Assuming we can use seat0 for X11 even though system says it doesn't support graphics!");
+                        g_debug ("GdmLocalDisplayFactory: This might indicate an issue where the framebuffer device is not tagged as master-of-seat in udev.");
+                        seat_supports_graphics = TRUE;
+                        g_strfreev (session_types);
+                        session_types = g_strdupv ((char **) legacy_session_types);
+#endif
+                } else {
+                        g_clear_handle_id (&factory->seat0_graphics_check_timeout_id, g_source_remove);
+                }
+        }
+
+        if (!seat_supports_graphics) {
                 if (is_seat0)
                         g_signal_emit (factory, signals[GRAPHICS_UNSUPPORTED], 0);
                 return;
         }
 
-        g_debug ("GdmLocalDisplayFactory: System supports graphics");
+        g_assert (session_types != NULL);
 
-        session_types = gdm_local_display_factory_get_session_types (factory);
-
-        g_debug ("GdmLocalDisplayFactory: %s login display for seat %s requested",
-                 session_types[0], seat_id);
+        if (g_strcmp0 (preferred_display_server, "legacy-xorg") == 0)
+                g_debug ("GdmLocalDisplayFactory: Legacy Xorg login display for seat %s requested",
+                         seat_id);
+        else
+                g_debug ("GdmLocalDisplayFactory: %s login display for seat %s requested",
+                         session_types[0], seat_id);
 
         /* Ensure we don't create the same display more than once */
         display = get_display_for_seat (factory, seat_id);
@@ -610,17 +966,42 @@ ensure_display_for_seat (GdmLocalDisplayFactory *factory,
 
         g_debug ("GdmLocalDisplayFactory: Adding display on seat %s", seat_id);
 
-        display = gdm_local_display_new ();
-        g_object_set (G_OBJECT (display),
-                      "supported-session-types", session_types,
-                      "seat-id", seat_id,
-                      "is-initial", is_seat0,
-                      NULL);
+#ifdef ENABLE_USER_DISPLAY_SERVER
+        if (g_strcmp0 (preferred_display_server, "wayland") == 0 ||
+            g_strcmp0 (preferred_display_server, "xorg") == 0) {
+                display = gdm_local_display_new ();
+                g_object_set (G_OBJECT (display),
+                              "session-type", session_types[0],
+                              "supported-session-types", session_types,
+                              NULL);
+        }
+#endif
+
+        if (display == NULL) {
+                guint32 num;
+
+                num = take_next_display_number (factory);
+
+                display = gdm_legacy_display_new (num);
+                g_object_set (G_OBJECT (display),
+                              "session-type", legacy_session_types[0],
+                              "supported-session-types", legacy_session_types,
+                              NULL);
+        }
+
+        g_object_set (display, "seat-id", seat_id, NULL);
+        g_object_set (display, "is-initial", is_seat0, NULL);
 
         store_display (factory, display);
 
-        if (!gdm_display_prepare (display))
+        /* let store own the ref */
+        g_object_unref (display);
+
+        if (! gdm_display_manage (display)) {
                 gdm_display_unmanage (display);
+        }
+
+        return;
 }
 
 static void
@@ -629,7 +1010,7 @@ delete_display (GdmLocalDisplayFactory *factory,
 
         GdmDisplayStore *store;
 
-        g_debug ("GdmLocalDisplayFactory: Removing displays on seat %s", seat_id);
+        g_debug ("GdmLocalDisplayFactory: Removing used_display_numbers on seat %s", seat_id);
 
         store = gdm_display_factory_get_display_store (GDM_DISPLAY_FACTORY (factory));
         gdm_display_store_foreach_remove (store, lookup_by_seat_id, (gpointer) seat_id);
@@ -808,6 +1189,7 @@ lookup_by_tty (const char *id,
         return g_strcmp0 (tty_to_check, tty_to_find) == 0;
 }
 
+#if defined(ENABLE_USER_DISPLAY_SERVER)
 static void
 maybe_stop_greeter_in_background (GdmLocalDisplayFactory *factory,
                                   GdmDisplay             *display)
@@ -981,6 +1363,7 @@ on_vt_changed (GIOChannel    *source,
 
         return G_SOURCE_CONTINUE;
 }
+#endif
 
 #ifdef HAVE_UDEV
 static void
@@ -1059,6 +1442,7 @@ gdm_local_display_factory_start_monitor (GdmLocalDisplayFactory *factory)
                                                        factory);
 #endif
 
+#if defined(ENABLE_USER_DISPLAY_SERVER)
         io_channel = g_io_channel_new_file ("/sys/class/tty/tty0/active", "r", NULL);
 
         if (io_channel != NULL) {
@@ -1069,6 +1453,7 @@ gdm_local_display_factory_start_monitor (GdmLocalDisplayFactory *factory)
                                         on_vt_changed,
                                         factory);
         }
+#endif
 }
 
 static void
@@ -1100,9 +1485,10 @@ gdm_local_display_factory_stop_monitor (GdmLocalDisplayFactory *factory)
                                                       factory->seat_attention_key);
                 factory->seat_attention_key = 0;
         }
+#if defined(ENABLE_USER_DISPLAY_SERVER)
         g_clear_handle_id (&factory->active_vt_watch_id, g_source_remove);
         g_clear_handle_id (&factory->wait_to_finish_timeout_id, g_source_remove);
-        g_clear_handle_id (&factory->seat0_graphics_check_timeout_id, g_source_remove);
+#endif
 }
 
 static void
@@ -1179,6 +1565,7 @@ gdm_local_display_factory_stop (GdmDisplayFactory *base_factory)
         g_signal_handlers_disconnect_by_func (G_OBJECT (store),
                                               G_CALLBACK (on_display_removed),
                                               factory);
+        g_clear_handle_id (&factory->seat0_graphics_check_timeout_id, g_source_remove);
 
         factory->is_started = FALSE;
 
@@ -1220,81 +1607,13 @@ handle_create_transient_display (GdmDBusLocalDisplayFactory *skeleton,
         g_autofree char *id = NULL;
         gboolean created;
 
-        created = gdm_local_display_factory_create_display (factory,
-                                                            NULL,
-                                                            &id,
-                                                            &error);
+        created = gdm_local_display_factory_create_transient_display (factory,
+                                                                      &id,
+                                                                      &error);
         if (!created) {
                 g_dbus_method_invocation_return_gerror (invocation, error);
         } else {
                 gdm_dbus_local_display_factory_complete_create_transient_display (skeleton, invocation, id);
-        }
-
-        return G_DBUS_METHOD_INVOCATION_HANDLED;
-}
-
-static gboolean
-handle_create_user_display (GdmDBusLocalDisplayFactory *skeleton,
-                            GDBusMethodInvocation      *invocation,
-                            const char                 *user,
-                            GdmLocalDisplayFactory     *factory)
-{
-        g_autoptr (GError) error = NULL;
-
-        if (!gdm_display_factory_on_user_display_creation (GDM_DISPLAY_FACTORY (factory),
-                                                           user,
-                                                           &error)) {
-                g_dbus_method_invocation_return_gerror (invocation, error);
-                return G_DBUS_METHOD_INVOCATION_HANDLED;
-        }
-
-        if (!gdm_local_display_factory_create_display (factory,
-                                                       user,
-                                                       NULL,
-                                                       &error)) {
-                g_dbus_method_invocation_return_gerror (invocation, error);
-                return G_DBUS_METHOD_INVOCATION_HANDLED;
-        }
-
-        gdm_dbus_local_display_factory_complete_create_user_display (skeleton,
-                                                                     invocation);
-
-        return G_DBUS_METHOD_INVOCATION_HANDLED;
-}
-
-static gboolean
-handle_destroy_user_display (GdmDBusLocalDisplayFactory *skeleton,
-                             GDBusMethodInvocation      *invocation,
-                             const char                 *user,
-                             GdmLocalDisplayFactory     *factory)
-{
-        g_autoptr (GError) error = NULL;
-
-        if (!gdm_display_factory_on_user_display_destruction (GDM_DISPLAY_FACTORY (factory),
-                                                              user,
-                                                              &error)) {
-                g_dbus_method_invocation_return_gerror (invocation, error);
-                return G_DBUS_METHOD_INVOCATION_HANDLED;
-        }
-
-        gdm_dbus_local_display_factory_complete_destroy_user_display (skeleton,
-                                                                      invocation);
-
-        return G_DBUS_METHOD_INVOCATION_HANDLED;
-}
-
-static gboolean
-on_authorize_method (GdmDBusLocalDisplayFactory *skeleton,
-                     GDBusMethodInvocation      *invocation,
-                     GdmLocalDisplayFactory     *factory)
-{
-        g_autoptr (GError) error = NULL;
-
-        if (!gdm_display_factory_authorize_manage_user_displays (GDM_DISPLAY_FACTORY (factory),
-                                                                 invocation,
-                                                                 &error)) {
-                g_dbus_method_invocation_return_gerror (invocation, error);
-                return FALSE;
         }
 
         return TRUE;
@@ -1318,20 +1637,6 @@ register_factory (GdmLocalDisplayFactory *factory)
         g_signal_connect (factory->skeleton,
                           "handle-create-transient-display",
                           G_CALLBACK (handle_create_transient_display),
-                          factory);
-
-        g_signal_connect (factory->skeleton,
-                          "handle-create-user-display",
-                          G_CALLBACK (handle_create_user_display),
-                          factory);
-
-        g_signal_connect (factory->skeleton,
-                          "handle-destroy-user-display",
-                          G_CALLBACK (handle_destroy_user_display),
-                          factory);
-
-        g_signal_connect (factory->skeleton, "g-authorize-method",
-                          G_CALLBACK (on_authorize_method),
                           factory);
 
         if (!g_dbus_interface_skeleton_export (G_DBUS_INTERFACE_SKELETON (factory->skeleton),
@@ -1395,6 +1700,7 @@ gdm_local_display_factory_class_init (GdmLocalDisplayFactoryClass *klass)
 static void
 gdm_local_display_factory_init (GdmLocalDisplayFactory *factory)
 {
+        factory->used_display_numbers = g_hash_table_new (NULL, NULL);
 }
 
 static void
@@ -1411,6 +1717,8 @@ gdm_local_display_factory_finalize (GObject *object)
 
         g_clear_object (&factory->connection);
         g_clear_object (&factory->skeleton);
+
+        g_hash_table_destroy (factory->used_display_numbers);
 
         gdm_local_display_factory_stop_monitor (factory);
 

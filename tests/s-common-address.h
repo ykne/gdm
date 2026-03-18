@@ -18,31 +18,11 @@
  * Boston, MA 02110-1301, USA.
  */
 
-#ifndef _GDM_SETTINGS_KEYS_H
-#define _GDM_SETTINGS_KEYS_H
+#ifndef __S_COMMON_ADDRESS_H
+#define __S_COMMON_ADDRESS_H
 
-#include <glib.h>
+#include <check.h>
 
-G_BEGIN_DECLS
+Suite   *suite_common_address                 (void);
 
-#define GDM_KEY_USER "daemon/User"
-#define GDM_KEY_GROUP "daemon/Group"
-#define GDM_KEY_AUTO_LOGIN_ENABLE "daemon/AutomaticLoginEnable"
-#define GDM_KEY_AUTO_LOGIN_USER "daemon/AutomaticLogin"
-#define GDM_KEY_TIMED_LOGIN_ENABLE "daemon/TimedLoginEnable"
-#define GDM_KEY_TIMED_LOGIN_USER "daemon/TimedLogin"
-#define GDM_KEY_TIMED_LOGIN_DELAY "daemon/TimedLoginDelay"
-#define GDM_KEY_INITIAL_SETUP_ENABLE "daemon/InitialSetupEnable"
-#ifdef ENABLE_X11_SUPPORT
-#define GDM_KEY_XORG_ENABLE "daemon/XorgEnable"
-#endif
-#define GDM_KEY_REMOTE_LOGIN_ENABLE "daemon/RemoteLoginEnable"
-
-#define GDM_KEY_DEBUG "debug/Enable"
-
-#define GDM_KEY_DISALLOW_TCP "security/DisallowTCP"
-#define GDM_KEY_ALLOW_REMOTE_AUTOLOGIN "security/AllowRemoteAutoLogin"
-
-G_END_DECLS
-
-#endif /* _GDM_SETTINGS_KEYS_H */
+#endif /* __S_COMMON_ADDRESS_H */

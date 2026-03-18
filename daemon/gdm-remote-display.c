@@ -60,19 +60,6 @@ gdm_remote_display_set_remote_id (GdmRemoteDisplay *display,
         g_object_set (G_OBJECT (display->skeleton), "remote-id", remote_id, NULL);
 }
 
-static gboolean
-handle_set_remote_id (GdmDBusRemoteDisplay    *skeleton,
-                      GDBusMethodInvocation   *invocation,
-                      const char              *remote_id,
-                      GdmRemoteDisplay        *display)
-{
-        g_object_set (G_OBJECT (display->skeleton), "remote-id", remote_id, NULL);
-
-        gdm_dbus_remote_display_complete_set_remote_id (skeleton, invocation);
-
-        return G_DBUS_METHOD_INVOCATION_HANDLED;
-}
-
 static GObject *
 gdm_remote_display_constructor (GType                  type,
                                 guint                  n_construct_properties,
@@ -90,11 +77,6 @@ gdm_remote_display_constructor (GType                  type,
                                               G_DBUS_INTERFACE_SKELETON (display->skeleton));
 
         g_object_bind_property (display, "session-id", display->skeleton, "session-id", G_BINDING_SYNC_CREATE);
-
-        g_signal_connect (display->skeleton,
-                          "handle-set-remote-id",
-                          G_CALLBACK (handle_set_remote_id),
-                          display);
 
         return G_OBJECT (display);
 }
@@ -114,8 +96,15 @@ gdm_remote_display_prepare (GdmDisplay *display)
 {
         GdmRemoteDisplay *self = GDM_REMOTE_DISPLAY (display);
         g_autoptr (GdmLaunchEnvironment) launch_environment = NULL;
+        g_autofree char *session_type = NULL;
+
+        g_object_get (self,
+                      "session-type", &session_type,
+                      NULL);
 
         launch_environment = gdm_create_greeter_launch_environment (NULL,
+                                                                    NULL,
+                                                                    session_type,
                                                                     NULL,
                                                                     FALSE);
 
@@ -142,8 +131,7 @@ gdm_remote_display_init (GdmRemoteDisplay *remote_display)
 }
 
 GdmDisplay *
-gdm_remote_display_new (const char *remote_id,
-                        const char *remote_hostname)
+gdm_remote_display_new (const char *remote_id)
 {
         GObject *object;
         GdmRemoteDisplay *self;
@@ -152,8 +140,8 @@ gdm_remote_display_new (const char *remote_id,
 
         object = g_object_new (GDM_TYPE_REMOTE_DISPLAY,
                                "is-local", FALSE,
+                               "session-type", session_types[0],
                                "supported-session-types", session_types,
-                               "remote-hostname", remote_hostname,
                                NULL);
 
         self = GDM_REMOTE_DISPLAY (object);

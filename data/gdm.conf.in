@@ -58,7 +58,10 @@
            send_member="GetSeatId"/>
     <allow send_destination="org.gnome.DisplayManager"
            send_interface="org.gnome.DisplayManager.Display"
-           send_member="GetSessionId"/>
+           send_member="GetX11DisplayName"/>
+    <allow send_destination="org.gnome.DisplayManager"
+           send_interface="org.gnome.DisplayManager.Display"
+           send_member="GetX11DisplayNumber"/>
     <allow send_destination="org.gnome.DisplayManager"
            send_interface="org.gnome.DisplayManager.Display"
            send_member="IsLocal"/>

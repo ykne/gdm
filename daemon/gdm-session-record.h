@@ -22,20 +22,28 @@
 #define __GDM_SESSION_RECORD_H
 
 #include <glib.h>
-#include "gdm-session.h"
 
 G_BEGIN_DECLS
 
-typedef enum {
-        GDM_SESSION_RECORD_LOGIN,
-        GDM_SESSION_RECORD_LOGOUT,
-        GDM_SESSION_RECORD_FAILED,
-} GdmSessionRecordEvent;
-
 void
-gdm_session_record (GdmSessionRecordEvent  event,
-                    GdmSession            *session,
-                    GPid                   pid);
+gdm_session_record_login  (GPid                  session_pid,
+                           const char           *user_name,
+                           const char           *host_name,
+                           const char           *x11_display_name,
+                           const char           *display_device);
+void
+gdm_session_record_logout (GPid                  session_pid,
+                           const char           *user_name,
+                           const char           *host_name,
+                           const char           *x11_display_name,
+                           const char           *display_device);
+void
+gdm_session_record_failed (GPid                  session_pid,
+                           const char           *user_name,
+                           const char           *host_name,
+                           const char           *x11_display_name,
+                           const char           *display_device);
+
 
 G_END_DECLS
 

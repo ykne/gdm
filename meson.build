@@ -63,8 +63,49 @@ libselinux_dep = dependency('libselinux', required: get_option('selinux'))
 polkit_dep = dependency('polkit-gobject-1')
 
 # X11
+# defaults
+x_path = '/usr/bin/X11:/usr/X11R6/bin:/opt/X11R6/bin'
+x_bin = '/usr/bin/X'
 if have_x11_support
+  xcb_dep = dependency('xcb')
+  x_deps = declare_dependency(
+    dependencies: [
+      dependency('x11'),
+      dependency('xau'),
+    ],
+  )
   xau_dep = dependency('xau')
+  # Xserver 1.17 & later default to -nolisten and require -listen for remote access
+  xserver_deps = dependency('xorg-server', version : '>=1.17', required : false)
+  xserver_has_listen = xserver_deps.found()
+  find_x_server_script = find_program('build-aux/find-x-server.sh', native: true, required: false)
+  if find_x_server_script.found()
+    find_x_server_out = run_command(find_x_server_script, check: false).stdout().strip()
+    if find_x_server_out != ''
+      x_bin = find_x_server_out
+      x_bin_path_split = x_bin.split('/')
+      i = 0
+      x_path = '/'
+      foreach dir : x_bin_path_split
+        if i < x_bin_path_split.length() - 1
+          x_path = x_path / dir
+        endif
+        i = i + 1
+      endforeach
+    endif
+  endif
+
+  xdmcp_dep = cc.find_library('Xdmcp', required: get_option('xdmcp'))
+  have_xdmcp = xdmcp_dep.found()
+  if have_xdmcp
+    gtk_dep = dependency('gtk+-3.0', version: '>= 2.91.1')
+  endif
+  if have_xdmcp and get_option('tcp-wrappers')
+    libwrap_dep = cc.find_library('wrap')
+  endif
+else
+  xserver_has_listen = false
+  have_xdmcp = false
 endif
 
 # systemd
@@ -73,6 +114,14 @@ systemd_dep = dependency('systemd', required: false)
 if logind_provider == 'systemd'
   libsystemd_dep = dependency('libsystemd')
   logind_dep = libsystemd_dep
+  systemd_multiseat_x = find_program('systemd-multi-seat-x',
+    required: false,
+    dirs: [
+      systemd_dep.get_variable(pkgconfig: 'systemdutildir', default_value: '/lib/systemd'),
+      '/lib/systemd',
+      '/usr/lib/systemd',
+    ])
+  systemd_x_server = systemd_multiseat_x.found()? systemd_multiseat_x.full_path() : '/lib/systemd/systemd-multi-seat-x'
 
   have_userdb = libsystemd_dep.version().version_compare('>= 257')
 
@@ -82,6 +131,7 @@ if logind_provider == 'systemd'
 else
   elogind_dep = dependency('libelogind')
   logind_dep = elogind_dep
+  systemd_x_server = 'disabled'
   have_userdb = false
   greeter_uid_min = 0
   greeter_uid_max = 0
@@ -231,7 +281,12 @@ conf.set_quoted('GDM_DEFAULTS_CONF', gdm_defaults_conf)
 conf.set_quoted('GDM_CUSTOM_CONF', gdm_custom_conf)
 conf.set_quoted('GDM_RUNTIME_CONF', gdm_runtime_conf)
 conf.set_quoted('GDM_SESSION_DEFAULT_PATH', get_option('default-path'))
+conf.set_quoted('GDM_USERNAME', get_option('user'))
 conf.set_quoted('GDM_GROUPNAME', get_option('group'))
+conf.set('HAVE_LIBXDMCP', have_xdmcp)
+conf.set_quoted('SYSTEMD_X_SERVER', systemd_x_server)
+conf.set_quoted('X_SERVER', x_bin)
+conf.set_quoted('X_PATH', x_path)
 conf.set('HAVE_USERDB', have_userdb)
 conf.set('GREETER_UID_MIN', greeter_uid_min)
 conf.set('GREETER_UID_MAX', greeter_uid_max)
@@ -266,6 +321,9 @@ subdir('po')
 if libcheck_dep.found()
   subdir('tests')
 endif
+if have_xdmcp
+  subdir('chooser')
+endif
 subdir('docs')
 
 gnome.post_install(
@@ -294,6 +352,9 @@ summary({
     'AT SPI registryd': at_spi_registryd_dir,
     'Lang config file': lang_config_file,
     'Pam MOD': pam_mod_dir,
+    'XServer': x_bin,
+    'XPath': x_path,
+    'Systemd XServer': systemd_x_server,
   },
   section: 'Paths',
 )
@@ -305,12 +366,17 @@ summary({
     'SeLinux': libselinux_dep.found(),
     'Logind Provider': get_option('logind-provider'),
     'Use GDM Xsession': get_option('gdm-xsession'),
+    'Use UserDisplayServer': get_option('user-display-server'),
     'Use SystemdJournal': get_option('systemd-journal'),
+    'Use WaylandSupport': get_option('wayland-support'),
     'Use X11Support': have_x11_support,
+    'Use XDMCP': have_xdmcp,
     'Use Profiling': get_option('profiling'),
     'Initial VT': get_option('initial-vt'),
+    'Username': get_option('user'),
     'Groupname': get_option('group'),
     'Plymouth': plymouth_dep.found(),
+    'Use ipv6': get_option('ipv6'),
   },
   section: 'Features',
   bool_yn: true,

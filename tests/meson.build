@@ -1,5 +1,6 @@
 m_common_test_src = [
   'm-common.c',
+  's-common-address.c',
   's-common.c',
 ]
 

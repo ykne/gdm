@@ -1,4 +1,5 @@
 libgdmcommon_src = files(
+  'gdm-address.c',
   'gdm-common.c',
   'gdm-file-utils.c',
   'gdm-log.c',
