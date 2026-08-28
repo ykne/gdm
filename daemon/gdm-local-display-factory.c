@@ -149,10 +149,22 @@ static char **
 gdm_local_display_factory_get_session_types (GdmLocalDisplayFactory *factory)
 {
         g_autoptr (GStrvBuilder) builder = NULL;
+        gboolean wayland_enabled = TRUE;
 
         builder = g_strv_builder_new ();
 
-        g_strv_builder_add (builder, "wayland");
+        /* Defaults to enabled - this is what lets a plain WaylandEnable=false
+         * in custom.conf skip Wayland entirely on hardware whose Wayland/KMS
+         * path doesn't work, so the very first session attempt goes straight
+         * to X11 instead of always trying (and failing) Wayland first. See
+         * project_gdm_wayland_only_greeter_risk.md / commit b8fbd8e "Make
+         * Wayland support mandatory" upstream, which dropped this key
+         * entirely on the (generally true, but not universal) assumption
+         * that Wayland always works. */
+        gdm_settings_direct_get_boolean (GDM_KEY_WAYLAND_ENABLE, &wayland_enabled);
+
+        if (wayland_enabled)
+                g_strv_builder_add (builder, "wayland");
 
 #ifdef ENABLE_X11_SUPPORT
         gboolean x11_enabled = FALSE;
@@ -183,6 +195,14 @@ gdm_local_display_factory_create_display (GdmLocalDisplayFactory  *factory,
         g_debug ("GdmLocalDisplayFactory: Creating local display");
 
         session_types = gdm_local_display_factory_get_session_types (factory);
+
+        if (session_types == NULL || session_types[0] == NULL) {
+                g_set_error_literal (error,
+                                     GDM_DISPLAY_ERROR,
+                                     GDM_DISPLAY_ERROR_GENERAL,
+                                     "Both Wayland and Xorg are disabled or unavailable");
+                return FALSE;
+        }
 
         display = gdm_local_display_new ();
         g_object_set (G_OBJECT (display),
@@ -597,6 +617,11 @@ ensure_display_for_seat (GdmLocalDisplayFactory *factory,
         g_debug ("GdmLocalDisplayFactory: System supports graphics");
 
         session_types = gdm_local_display_factory_get_session_types (factory);
+
+        if (session_types == NULL || session_types[0] == NULL) {
+                g_warning ("GdmLocalDisplayFactory: Both Wayland and Xorg are disabled or unavailable, not creating display for seat %s", seat_id);
+                return;
+        }
 
         g_debug ("GdmLocalDisplayFactory: %s login display for seat %s requested",
                  session_types[0], seat_id);
