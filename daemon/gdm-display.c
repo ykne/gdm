@@ -1275,6 +1275,14 @@ gdm_display_start_greeter_session (GdmDisplay *self)
                                  G_CALLBACK (on_launch_environment_session_died),
                                  self, 0);
 
+        /* Must happen before start() - it needs this to select the right
+         * greeter session type (x11 vs wayland) up front, not just to
+         * label the session correctly afterward. See the comment in
+         * gdm_launch_environment_start(). */
+        g_object_set (priv->launch_environment,
+                      "supported-session-types", priv->supported_session_types,
+                      NULL);
+
         gdm_launch_environment_start (priv->launch_environment);
 
         session = gdm_launch_environment_get_session (priv->launch_environment);
