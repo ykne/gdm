@@ -82,6 +82,7 @@ struct _GdmLaunchEnvironment
         char           *display_seat_id;
         char           *display_hostname;
         gboolean        display_is_local;
+        GStrv           supported_session_types;
 };
 
 enum {
@@ -94,6 +95,7 @@ enum {
         PROP_USER_MEMBER_OF,
         PROP_DCONF_PROFILE,
         PROP_SESSION_NAME,
+        PROP_SUPPORTED_SESSION_TYPES,
 };
 
 enum {
@@ -615,12 +617,21 @@ gdm_launch_environment_start (GdmLaunchEnvironment *launch_environment)
                                  launch_environment,
                                  0);
 
+        /* Must be set before select_session() below - that's what triggers
+         * GdmSession's own update_session_type()/gdm_session_is_wayland_session()
+         * search, which needs the real supported-session-types to pick the
+         * right greeter session file (and therefore type) rather than
+         * falling back to gdm_session_set_supported_session_types()'s own
+         * wayland-first default. See project_gdm_wayland_only_greeter_risk.md -
+         * this (plus the display-level WaylandEnable restoration) is what
+         * lets a WaylandEnable=false greeter actually land on x11 instead of
+         * always being forced back to wayland regardless. */
+        g_object_set (G_OBJECT (launch_environment->session),
+                      "supported-session-types", launch_environment->supported_session_types,
+                      NULL);
+
         gdm_session_start_conversation (launch_environment->session, "gdm-launch-environment");
         gdm_session_select_session (launch_environment->session, launch_environment->session_name);
-
-        g_object_set (G_OBJECT (launch_environment->session),
-                      "session-type", "wayland",
-                      NULL);
 
         return TRUE;
 }
@@ -730,6 +741,14 @@ _gdm_launch_environment_set_session_name (GdmLaunchEnvironment *launch_environme
 }
 
 static void
+_gdm_launch_environment_set_supported_session_types (GdmLaunchEnvironment *launch_environment,
+                                                      const char * const   *supported_session_types)
+{
+        g_strfreev (launch_environment->supported_session_types);
+        launch_environment->supported_session_types = g_strdupv ((GStrv) supported_session_types);
+}
+
+static void
 gdm_launch_environment_set_property (GObject      *object,
                                      guint         prop_id,
                                      const GValue *value,
@@ -763,6 +782,9 @@ gdm_launch_environment_set_property (GObject      *object,
                 break;
         case PROP_SESSION_NAME:
                 _gdm_launch_environment_set_session_name (self, g_value_get_string (value));
+                break;
+        case PROP_SUPPORTED_SESSION_TYPES:
+                _gdm_launch_environment_set_supported_session_types (self, g_value_get_boxed (value));
                 break;
         default:
                 G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -804,6 +826,9 @@ gdm_launch_environment_get_property (GObject    *object,
                 break;
         case PROP_SESSION_NAME:
                 g_value_set_string (value, self->session_name);
+                break;
+        case PROP_SUPPORTED_SESSION_TYPES:
+                g_value_set_boxed (value, self->supported_session_types);
                 break;
         default:
                 G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -876,6 +901,13 @@ gdm_launch_environment_class_init (GdmLaunchEnvironmentClass *klass)
                                                               "session name",
                                                               NULL,
                                                               G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY | G_PARAM_STATIC_STRINGS));
+        g_object_class_install_property (object_class,
+                                         PROP_SUPPORTED_SESSION_TYPES,
+                                         g_param_spec_boxed ("supported-session-types",
+                                                             "supported session types",
+                                                             "supported session types",
+                                                             G_TYPE_STRV,
+                                                             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
         signals [OPENED] =
                 g_signal_new ("opened",
                               G_OBJECT_CLASS_TYPE (object_class),
@@ -963,6 +995,7 @@ gdm_launch_environment_finalize (GObject *object)
         g_free (launch_environment->display_seat_id);
         g_free (launch_environment->display_hostname);
         g_free (launch_environment->session_id);
+        g_strfreev (launch_environment->supported_session_types);
 
         g_clear_object (&launch_environment->dyn_user_store);
 
