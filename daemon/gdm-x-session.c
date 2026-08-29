@@ -670,11 +670,37 @@ spawn_session (State        *state,
                 g_subprocess_launcher_setenv (launcher, "WINDOWPATH", vt, TRUE);
         }
 
-        subprocess = g_subprocess_launcher_spawn (launcher,
-                                                  &error,
-                                                  GDMCONFDIR "/Xsession",
-                                                  state->session_command,
-                                                  NULL);
+        if (g_strcmp0 (g_getenv ("XDG_SESSION_CLASS"), "greeter") == 0) {
+                /* The greeter's dynamically-allocated account intentionally
+                 * has no usable shell (/usr/bin/nologin) - Xsession's own
+                 * launch convention (exec -l $SHELL -c ...) exists to source
+                 * a real user's .xprofile/.Xresources/ssh-agent setup, none
+                 * of which applies to the greeter (no home directory,
+                 * throwaway account). DISPLAY/XAUTHORITY are already set
+                 * above regardless of this branch, so gnome-session doesn't
+                 * need Xsession's involvement to know it's running under
+                 * X11. Launch it directly instead - exactly what
+                 * gdm-wayland-session.c's own spawn_session() already does
+                 * for the Wayland greeter, same session command either way,
+                 * proven to work there. Real (non-greeter) X11 sessions keep
+                 * going through Xsession unchanged below. */
+                g_auto (GStrv) argv = NULL;
+
+                if (!g_shell_parse_argv (state->session_command, NULL, &argv, &error)) {
+                        g_debug ("could not parse session arguments: %s", error->message);
+                        goto out;
+                }
+
+                subprocess = g_subprocess_launcher_spawnv (launcher,
+                                                           (const char * const *) argv,
+                                                           &error);
+        } else {
+                subprocess = g_subprocess_launcher_spawn (launcher,
+                                                          &error,
+                                                          GDMCONFDIR "/Xsession",
+                                                          state->session_command,
+                                                          NULL);
+        }
 
         if (subprocess == NULL) {
                 g_debug ("could not start session: %s", error->message);
