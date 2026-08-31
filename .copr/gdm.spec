@@ -68,6 +68,7 @@ Requires: dconf
 Requires: gnome-keyring-pam
 Requires: gnome-session >= 50~alpha
 Requires: gnome-session-wayland-session >= 50~alpha
+Requires: gnome-session-xsession >= 50~alpha
 Requires: gnome-settings-daemon >= 3.27.90
 Requires: gnome-shell
 Requires: iso-codes
