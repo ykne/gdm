@@ -19,8 +19,11 @@
  */
 #include "config.h"
 
+#include <errno.h>
 #include <locale.h>
+#include <signal.h>
 #include <sysexits.h>
+#include <unistd.h>
 
 #include "gdm-common.h"
 #include "gdm-settings-direct.h"
@@ -590,6 +593,15 @@ out:
         g_main_loop_quit (state->main_loop);
 }
 
+/* GSpawnChildSetupFunc for the session subprocess - runs in the child,
+ * right after fork(), before exec(). See signal_subprocesses() for why
+ * this matters. */
+static void
+session_child_setup (gpointer user_data)
+{
+        setpgid (0, 0);
+}
+
 static gboolean
 spawn_session (State        *state,
                GCancellable *cancellable)
@@ -619,6 +631,10 @@ spawn_session (State        *state,
         g_debug ("Running X session");
 
         launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_NONE);
+
+        /* Put the session in a new process group of its own, separate from
+         * ours - see signal_subprocesses() below for why. */
+        g_subprocess_launcher_set_child_setup (launcher, session_child_setup, NULL, NULL);
 
         if (state->environment != NULL) {
                 size_t i;
@@ -725,7 +741,36 @@ static void
 signal_subprocesses (State *state)
 {
         if (state->session_subprocess != NULL) {
-                g_subprocess_send_signal (state->session_subprocess, SIGTERM);
+                const char *identifier;
+                pid_t       pid;
+
+                /* Signal the whole process group, not just our direct
+                 * child. That child is, by the time this runs, whatever
+                 * /etc/gdm/Xsession's "exec -l $SHELL -c ..." convention
+                 * replaced it with - for $SHELL=bash that's already the
+                 * real session leader (bash execs a single simple -c
+                 * command in place, no fork), but for a shell that forks
+                 * instead of exec'ing its -c command (tcsh does; see
+                 * session_child_setup() above, which is what makes this
+                 * group-wide signal safe: it puts this whole subtree in
+                 * its own process group, isolated from ours, at spawn
+                 * time), our direct child is just a wrapper around the
+                 * real leader, and a plain g_subprocess_send_signal()
+                 * here would never reach it - only the wrapper, which
+                 * for a login shell that ignores SIGTERM (tcsh does)
+                 * would silently drop it, orphaning the leader with no
+                 * graceful shutdown ever attempted. */
+                identifier = g_subprocess_get_identifier (state->session_subprocess);
+                pid = identifier != NULL ? (pid_t) atol (identifier) : -1;
+
+                if (pid > 0) {
+                        if (kill (-pid, SIGTERM) < 0 && errno != ESRCH) {
+                                g_warning ("gdm-x-session: could not SIGTERM session process group %d: %s",
+                                          (int) pid, g_strerror (errno));
+                        }
+                } else {
+                        g_subprocess_send_signal (state->session_subprocess, SIGTERM);
+                }
         }
 
         if (state->bus_subprocess != NULL) {
