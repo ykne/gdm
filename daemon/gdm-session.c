@@ -3569,6 +3569,10 @@ gdm_session_select_session (GdmSession *self,
                                                                get_session_name (self),
                                                                conversation->worker_cancellable,
                                                                NULL, NULL);
+                        gdm_dbus_worker_call_set_session_type (conversation->worker_proxy,
+                                                               self->session_type,
+                                                               conversation->worker_cancellable,
+                                                               NULL, NULL);
                 }
         }
 }

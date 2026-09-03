@@ -2377,6 +2377,20 @@ gdm_session_worker_handle_set_session_name (GdmDBusWorker         *object,
 }
 
 static gboolean
+gdm_session_worker_handle_set_session_type (GdmDBusWorker         *object,
+                                            GDBusMethodInvocation *invocation,
+                                            const char            *session_type)
+{
+        GdmSessionWorker *worker = GDM_SESSION_WORKER (object);
+        g_debug ("GdmSessionWorker: session type set to %s", session_type);
+        if (worker->user_settings != NULL)
+                gdm_session_settings_set_session_type (worker->user_settings,
+                                                       session_type);
+        gdm_dbus_worker_complete_set_session_type (object, invocation);
+        return TRUE;
+}
+
+static gboolean
 gdm_session_worker_handle_set_session_display_mode (GdmDBusWorker         *object,
                                                     GDBusMethodInvocation *invocation,
                                                     const char            *str)
@@ -3174,6 +3188,7 @@ worker_interface_init (GdmDBusWorkerIface *interface)
         interface->handle_open = gdm_session_worker_handle_open;
         interface->handle_set_language_name = gdm_session_worker_handle_set_language_name;
         interface->handle_set_session_name = gdm_session_worker_handle_set_session_name;
+        interface->handle_set_session_type = gdm_session_worker_handle_set_session_type;
         interface->handle_set_session_display_mode = gdm_session_worker_handle_set_session_display_mode;
         interface->handle_set_environment_variable = gdm_session_worker_handle_set_environment_variable;
         interface->handle_start_program = gdm_session_worker_handle_start_program;
