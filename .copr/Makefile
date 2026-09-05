@@ -7,7 +7,7 @@
 # pipeline (see github.com/ykne/GNOME-X11-specs), scoped to this package.
 
 PKG := gdm
-VERSION := 50.2
+VERSION := 50.3
 
 .PHONY: srpm
 srpm:
