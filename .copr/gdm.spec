@@ -1,7 +1,5 @@
 %global _hardened_build 1
 
-%define gtk3_version 2.99.2
-
 %global major_version %%(echo %{version} | cut -d '.' -f1 | cut -d '~' -f1)
 %global tarball_version %%(echo %{version} | tr '~' '.')
 
@@ -15,7 +13,7 @@
 
 Name:           gdm
 Epoch:          1
-Version:        50.3
+Version:        51.0
 Release:        %autorelease
 Summary:        The GNOME Display Manager
 
@@ -40,11 +38,9 @@ BuildRequires:  pkgconfig(accountsservice) >= 0.6.3
 BuildRequires:  pkgconfig(audit)
 BuildRequires:  pkgconfig(check)
 BuildRequires:  pkgconfig(gobject-introspection-1.0)
-BuildRequires:  pkgconfig(gtk+-3.0) >= %{gtk3_version}
 BuildRequires:  pkgconfig(gudev-1.0)
 BuildRequires:  pkgconfig(iso-codes)
 BuildRequires:  pkgconfig(json-glib-1.0)
-BuildRequires:  pkgconfig(libcanberra-gtk3)
 BuildRequires:  pkgconfig(libkeyutils)
 BuildRequires:  pkgconfig(libselinux)
 BuildRequires:  pkgconfig(libsystemd)
@@ -65,7 +61,7 @@ Requires: accountsservice
 Requires: dbus-common
 Requires: dconf
 # since we use it, and pam spams the log if the module is missing
-Requires: gnome-keyring-pam
+Requires: pam_oo7
 Requires: gnome-session >= 50~alpha
 Requires: gnome-session-wayland-session >= 50~alpha
 Requires: gnome-session-xsession >= 50~alpha
@@ -157,8 +153,9 @@ ln -sf ../X11/xinit/Xsession %{buildroot}%{_sysconfdir}/gdm/
 %license COPYING
 %dir %{_sysconfdir}/gdm
 %config(noreplace) %{_sysconfdir}/gdm/custom.conf
-%config %{_sysconfdir}/pam.d/gdm-autologin
-%config %{_sysconfdir}/pam.d/gdm-password
+%{_prefix}/lib/pam.d/gdm-autologin
+%{_prefix}/lib/pam.d/gdm-password
+%{_prefix}/lib/pam.d/gdm-password-auth-substack
 # not config files
 %if %{with x11}
 %{_sysconfdir}/gdm/Xsession
@@ -204,10 +201,13 @@ ln -sf ../X11/xinit/Xsession %{buildroot}%{_sysconfdir}/gdm/
 %ghost %dir %{_localstatedir}/log/gdm
 %ghost %dir %{_localstatedir}/lib/gdm
 %ghost %dir %{_rundir}/gdm
-%config %{_sysconfdir}/pam.d/gdm-smartcard
-%config %{_sysconfdir}/pam.d/gdm-fingerprint
-%config %{_sysconfdir}/pam.d/gdm-switchable-auth
-%{_sysconfdir}/pam.d/gdm-launch-environment
+%{_prefix}/lib/pam.d/gdm-smartcard
+%{_prefix}/lib/pam.d/gdm-smartcard-auth-substack
+%{_prefix}/lib/pam.d/gdm-fingerprint
+%{_prefix}/lib/pam.d/gdm-fingerprint-auth-substack
+%{_prefix}/lib/pam.d/gdm-switchable-auth
+%{_prefix}/lib/pam.d/gdm-switchable-auth-substack
+%{_prefix}/lib/pam.d/gdm-launch-environment
 %{_unitdir}/gdm.service
 %{_unitdir}/gnome-headless-session@.service
 %dir %{_userunitdir}/gnome-session@gnome-login.target.d/
